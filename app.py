@@ -1,29 +1,26 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-from datetime import datetime
+import re
+from dataclasses import dataclass
 from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import streamlit as st
 import torch
-from chromadb.config import Settings
-from langchain.retrievers import EnsembleRetriever
-from langchain.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
-from langchain_chroma import Chroma
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from transformers import pipeline
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
 
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
@@ -33,24 +30,6 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-MANIFEST_PATH = ARTIFACTS_DIR / "manifest.json"
-
-SYSTEM_PROMPT = """You are a transit compliance assistant for U.S. public transportation professionals.
-Answer only from the provided regulatory excerpts.
-If the excerpts do not fully answer the question, say that the provided documents do not contain enough information.
-Every substantive sentence must include a citation in this exact style: [49 CFR Part 37, p. 12].
-Do not use outside knowledge and do not invent section numbers, page numbers, or policy details."""
-
-USER_PROMPT = """Use only the following excerpts from the provided regulations.
-
-Question:
-{question}
-
-Excerpts:
-{context}
-
-Write a concise answer with citations after each substantive sentence."""
 
 EXAMPLE_PROMPTS = [
     "What accessibility requirements apply to lifts and ramps on transit vehicles?",
@@ -59,9 +38,41 @@ EXAMPLE_PROMPTS = [
 ]
 
 
+@dataclass(frozen=True)
+class SourceSpec:
+    title: str
+    file_name: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    sources: tuple[SourceSpec, ...] = (
+        SourceSpec(
+            title="49 CFR Part 37",
+            file_name="49 CFR Part 37 (up to date as of 3-09-2026).pdf",
+        ),
+        SourceSpec(
+            title="49 CFR Part 38",
+            file_name="CFR-2024-title49-vol1-part38.pdf",
+        ),
+    )
+    embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
+    qa_model_id: str = "distilbert-base-cased-distilled-squad"
+    chunk_size: int = 950
+    chunk_overlap: int = 180
+    dense_top_k: int = 8
+    bm25_top_k: int = 8
+    final_top_k: int = 5
+    min_answer_score: float = 0.12
+    max_answer_candidates: int = 3
+
+
+CONFIG = AppConfig()
+
+
 def resolve_runtime_device() -> tuple[str, str | None]:
     if not torch.cuda.is_available():
-        return "cpu", "CUDA is not available in the current PyTorch runtime."
+        return "cpu", "Running on CPU. This is expected on Streamlit Community Cloud."
 
     try:
         capability = torch.cuda.get_device_capability(0)
@@ -70,175 +81,206 @@ def resolve_runtime_device() -> tuple[str, str | None]:
         if supported_arches and capability_tag not in supported_arches:
             return (
                 "cpu",
-                f"Detected GPU capability {capability_tag}, but this PyTorch build only supports: "
-                + ", ".join(sorted(supported_arches)),
+                f"Detected GPU capability {capability_tag}, but the runtime does not support it.",
             )
 
-        # Force a tiny CUDA op so unsupported kernels fail here instead of during embedding.
         torch.zeros(1, device="cuda")
         return "cuda", None
     except Exception as error:
         return "cpu", f"CUDA initialization failed: {error}"
 
 
-def detect_device() -> str:
-    return resolve_runtime_device()[0]
+def normalize_text(text: str) -> str:
+    text = text.replace("\u0000", " ")
+    text = text.replace("\r", "\n")
+    text = re.sub(r"(?<=\w)-\s*\n(?=\w)", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def format_timestamp(value: str | None) -> str:
-    if not value:
-        return "Unknown"
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%b %d, %Y %I:%M %p")
-    except ValueError:
-        return value
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def split_sentences(text: str) -> list[str]:
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(])", " ".join(text.split()))
+    cleaned = [sentence.strip() for sentence in sentences if sentence.strip()]
+    return cleaned or [text.strip()]
+
+
+def overlap_score(question: str, sentence: str) -> float:
+    question_tokens = set(tokenize(question))
+    sentence_tokens = tokenize(sentence)
+    if not question_tokens or not sentence_tokens:
+        return 0.0
+    shared = sum(1 for token in sentence_tokens if token in question_tokens)
+    return shared / max(len(question_tokens), 1)
 
 
 @lru_cache(maxsize=1)
-def load_manifest() -> dict[str, Any]:
-    if not MANIFEST_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing {MANIFEST_PATH}. Run code.ipynb first to build the artifacts."
-        )
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+def load_source_pages() -> tuple[list[Document], list[dict[str, Any]]]:
+    pages: list[Document] = []
+    document_stats: list[dict[str, Any]] = []
 
+    for source in CONFIG.sources:
+        pdf_path = PROJECT_ROOT / source.file_name
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"Missing source PDF: {pdf_path}")
 
-@lru_cache(maxsize=1)
-def load_chunk_documents() -> list[Document]:
-    manifest = load_manifest()
-    chunks_path = Path(manifest["paths"]["chunks_path"])
-    if not chunks_path.exists():
-        raise FileNotFoundError(
-            f"Missing {chunks_path}. Run code.ipynb first to build the artifacts."
-        )
+        loader = PyMuPDFLoader(str(pdf_path))
+        raw_pages = loader.load()
+        source_key = slugify(source.title)
+        page_count = 0
 
-    documents: list[Document] = []
-    with chunks_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            documents.append(
+        for raw_page in raw_pages:
+            content = normalize_text(raw_page.page_content)
+            if not content:
+                continue
+
+            page_number = int(raw_page.metadata.get("page", 0)) + 1
+            page_count += 1
+            pages.append(
                 Document(
-                    page_content=record["page_content"],
-                    metadata=record["metadata"],
+                    page_content=content,
+                    metadata={
+                        "source_key": source_key,
+                        "source_title": source.title,
+                        "source_file": pdf_path.name,
+                        "source_path": str(pdf_path),
+                        "page": page_number,
+                        "citation": f"{source.title}, p. {page_number}",
+                    },
                 )
             )
-    return documents
+
+        document_stats.append(
+            {
+                "title": source.title,
+                "file_name": source.file_name,
+                "path": str(pdf_path),
+                "page_count": page_count,
+            }
+        )
+
+    return pages, document_stats
+
+
+def build_chunks(pages: list[Document]) -> list[Document]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CONFIG.chunk_size,
+        chunk_overlap=CONFIG.chunk_overlap,
+        separators=["\n\n", "\n", ". ", "; ", " ", ""],
+    )
+    split_docs = splitter.split_documents(pages)
+    chunks: list[Document] = []
+
+    for index, chunk in enumerate(split_docs, start=1):
+        metadata = dict(chunk.metadata)
+        first_line = next((line.strip() for line in chunk.page_content.splitlines() if line.strip()), "")
+        metadata["chunk_id"] = f"{metadata['source_key']}::p{metadata['page']:03d}::c{index:05d}"
+        metadata["section_hint"] = first_line[:160]
+        metadata["char_count"] = len(chunk.page_content)
+        chunks.append(Document(page_content=chunk.page_content, metadata=metadata))
+
+    return chunks
 
 
 class TransitComplianceBot:
     def __init__(self) -> None:
-        self.manifest = load_manifest()
         self.device, self.device_warning = resolve_runtime_device()
-        self.documents = load_chunk_documents()
-        self.generator_tokenizer = AutoTokenizer.from_pretrained(
-            self.manifest["models"]["generator_dir"],
-            trust_remote_code=False,
-        )
-        if self.generator_tokenizer.pad_token is None:
-            self.generator_tokenizer.pad_token = self.generator_tokenizer.eos_token
-
+        self.pages, self.document_stats = load_source_pages()
+        self.documents = build_chunks(self.pages)
+        self.summary = self._build_summary()
         self.embeddings = self._build_embeddings()
-        self.vector_store = self._build_vector_store()
-        self.hybrid_retriever = self._build_hybrid_retriever()
-        self.reranker = self._build_reranker()
-        self.llm = self._build_llm()
+        self.embedding_matrix = self._build_embedding_matrix()
+        self.bm25 = self._build_bm25()
+        self.qa = self._build_qa_pipeline()
+
+    def _build_summary(self) -> dict[str, Any]:
+        avg_chunk_chars = round(
+            sum(len(document.page_content) for document in self.documents) / max(len(self.documents), 1),
+            2,
+        )
+        return {
+            "created_at_utc": None,
+            "documents": self.document_stats,
+            "stats": {
+                "page_count": len(self.pages),
+                "chunk_count": len(self.documents),
+                "avg_chunk_chars": avg_chunk_chars,
+            },
+            "runtime": {
+                "mode": "cloud-portable",
+                "embedding_model_id": CONFIG.embedding_model_id,
+                "qa_model_id": CONFIG.qa_model_id,
+                "dense_top_k": CONFIG.dense_top_k,
+                "bm25_top_k": CONFIG.bm25_top_k,
+                "final_top_k": CONFIG.final_top_k,
+            },
+        }
 
     def _build_embeddings(self) -> HuggingFaceEmbeddings:
+        batch_size = 32 if self.device == "cuda" else 8
         return HuggingFaceEmbeddings(
-            model_name=self.manifest["models"]["embedding_dir"],
+            model_name=CONFIG.embedding_model_id,
             model_kwargs={"device": self.device},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
         )
 
-    def _build_vector_store(self) -> Chroma:
-        return Chroma(
-            collection_name=self.manifest["retrieval"]["collection_name"],
-            persist_directory=self.manifest["paths"]["vector_db_dir"],
-            embedding_function=self.embeddings,
-            client_settings=Settings(anonymized_telemetry=False),
+    def _build_embedding_matrix(self) -> np.ndarray:
+        vectors = np.asarray(
+            self.embeddings.embed_documents([document.page_content for document in self.documents]),
+            dtype=np.float32,
+        )
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vectors / norms
+
+    def _build_bm25(self) -> BM25Retriever:
+        retriever = BM25Retriever.from_documents(self.documents)
+        retriever.k = CONFIG.bm25_top_k
+        return retriever
+
+    def _build_qa_pipeline(self):
+        device_index = 0 if self.device == "cuda" else -1
+        return pipeline(
+            task="question-answering",
+            model=CONFIG.qa_model_id,
+            tokenizer=CONFIG.qa_model_id,
+            device=device_index,
         )
 
-    def _build_hybrid_retriever(self) -> EnsembleRetriever:
-        vector_retriever = self.vector_store.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": self.manifest["retrieval"]["dense_top_k"],
-                "fetch_k": self.manifest["retrieval"]["dense_fetch_k"],
-            },
-        )
-        bm25_retriever = BM25Retriever.from_documents(self.documents)
-        bm25_retriever.k = self.manifest["retrieval"]["bm25_top_k"]
+    def _dense_search(self, question: str) -> list[tuple[Document, float]]:
+        query_vector = np.asarray(self.embeddings.embed_query(question), dtype=np.float32)
+        query_norm = np.linalg.norm(query_vector)
+        if query_norm == 0:
+            return []
+        query_vector = query_vector / query_norm
 
-        return EnsembleRetriever(
-            retrievers=[vector_retriever, bm25_retriever],
-            weights=[0.7, 0.3],
-            id_key="chunk_id",
-        )
-
-    def _build_reranker(self) -> CrossEncoderReranker:
-        cross_encoder = HuggingFaceCrossEncoder(
-            model_name=self.manifest["models"]["reranker_dir"],
-            model_kwargs={"device": self.device},
-        )
-        return CrossEncoderReranker(
-            model=cross_encoder,
-            top_n=self.manifest["retrieval"]["rerank_top_n"],
-        )
-
-    def _build_llm(self) -> HuggingFacePipeline:
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            self.manifest["models"]["generator_dir"],
-            torch_dtype=dtype,
-            device_map="auto" if self.device == "cuda" else None,
-            low_cpu_mem_usage=True,
-            trust_remote_code=False,
-        )
-        text_generation = pipeline(
-            task="text-generation",
-            model=model,
-            tokenizer=self.generator_tokenizer,
-            max_new_tokens=self.manifest["generation"]["max_new_tokens"],
-            do_sample=self.manifest["generation"]["do_sample"],
-            temperature=self.manifest["generation"]["temperature"],
-            repetition_penalty=1.05,
-            return_full_text=False,
-            pad_token_id=self.generator_tokenizer.eos_token_id,
-        )
-        return HuggingFacePipeline(pipeline=text_generation)
+        similarities = self.embedding_matrix @ query_vector
+        top_indices = np.argsort(-similarities)[: CONFIG.dense_top_k]
+        return [(self.documents[index], float(similarities[index])) for index in top_indices]
 
     def retrieve(self, question: str) -> list[Document]:
-        documents = self.hybrid_retriever.invoke(question)
-        if not documents:
-            return []
-        reranked = self.reranker.compress_documents(documents, question)
-        return list(reranked)[: self.manifest["retrieval"]["max_context_chunks"]]
+        fused: dict[str, dict[str, Any]] = {}
 
-    @staticmethod
-    def _format_context(documents: list[Document]) -> str:
-        blocks = []
-        for index, document in enumerate(documents, start=1):
-            citation = document.metadata.get("citation", "Unknown source")
-            excerpt = " ".join(document.page_content.split())
-            blocks.append(f"[{index}] {citation}\n{excerpt}")
-        return "\n\n".join(blocks)
+        for rank, (document, score) in enumerate(self._dense_search(question), start=1):
+            chunk_id = document.metadata["chunk_id"]
+            fused.setdefault(chunk_id, {"document": document, "score": 0.0})
+            fused[chunk_id]["score"] += (1.15 / (rank + 2)) + (0.35 * max(score, 0.0))
 
-    def _build_prompt(self, question: str, documents: list[Document]) -> str:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": USER_PROMPT.format(
-                    question=question,
-                    context=self._format_context(documents),
-                ),
-            },
-        ]
-        return self.generator_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        for rank, document in enumerate(self.bm25.invoke(question), start=1):
+            chunk_id = document.metadata["chunk_id"]
+            fused.setdefault(chunk_id, {"document": document, "score": 0.0})
+            fused[chunk_id]["score"] += 1.0 / (rank + 2)
+
+        ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
+        return [item["document"] for item in ranked[: CONFIG.final_top_k]]
 
     @staticmethod
     def _collect_sources(documents: list[Document]) -> list[str]:
@@ -269,15 +311,74 @@ class TransitComplianceBot:
             )
         return payload
 
+    def _best_supporting_sentence(self, question: str, document: Document, answer: str = "") -> str:
+        sentences = split_sentences(document.page_content)
+        answer_lower = answer.lower().strip()
+        ranked_sentences = []
+        for sentence in sentences:
+            score = overlap_score(question, sentence)
+            if answer_lower and answer_lower in sentence.lower():
+                score += 1.5
+            ranked_sentences.append((score, sentence))
+
+        ranked_sentences.sort(key=lambda item: item[0], reverse=True)
+        return ranked_sentences[0][1].strip()
+
+    def _extract_answer_candidates(self, question: str, documents: list[Document]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        seen_sentences: set[str] = set()
+
+        for document in documents:
+            result = self.qa(
+                question=question,
+                context=document.page_content,
+                handle_impossible_answer=True,
+                max_answer_len=96,
+            )
+            answer_text = " ".join(str(result.get("answer", "")).split()).strip()
+            score = float(result.get("score", 0.0))
+
+            if not answer_text or answer_text.lower() in {"empty", "[cls]"} or score < CONFIG.min_answer_score:
+                supporting_sentence = self._best_supporting_sentence(question, document)
+                score = overlap_score(question, supporting_sentence)
+            else:
+                supporting_sentence = self._best_supporting_sentence(question, document, answer_text)
+                score += overlap_score(question, supporting_sentence)
+
+            normalized_sentence = supporting_sentence.lower()
+            if not supporting_sentence or normalized_sentence in seen_sentences:
+                continue
+
+            seen_sentences.add(normalized_sentence)
+            candidates.append(
+                {
+                    "sentence": supporting_sentence,
+                    "citation": document.metadata.get("citation", "Unknown source"),
+                    "score": score,
+                }
+            )
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return candidates
+
     def generate_answer(self, question: str, documents: list[Document]) -> str:
         if not documents:
             return "I do not have enough information in the provided documents to answer that question."
 
-        prompt = self._build_prompt(question, documents)
-        response = self.llm.invoke(prompt)
-        if isinstance(response, str):
-            return response.strip()
-        return str(response).strip()
+        candidates = self._extract_answer_candidates(question, documents)
+        if not candidates:
+            return "I could not find a sufficiently grounded answer in the provided documents."
+
+        selected = candidates[: CONFIG.max_answer_candidates]
+        lines = [f"{selected[0]['sentence']} [{selected[0]['citation']}]"]
+
+        if len(selected) > 1:
+            lines.append("")
+            lines.append("Additional relevant provisions:")
+            for candidate in selected[1:]:
+                lines.append(f"- {candidate['sentence']} [{candidate['citation']}]")
+
+        return "\n".join(lines)
 
     def ask(self, question: str) -> dict[str, Any]:
         documents = self.retrieve(question)
@@ -290,7 +391,7 @@ class TransitComplianceBot:
         }
 
 
-@st.cache_resource(show_spinner="Loading local models and indexed regulations...")
+@st.cache_resource(show_spinner="Loading PDFs, building the in-memory index, and downloading lightweight models...")
 def get_bot() -> TransitComplianceBot:
     return TransitComplianceBot()
 
@@ -298,7 +399,6 @@ def get_bot() -> TransitComplianceBot:
 def apply_theme() -> None:
     st.set_page_config(
         page_title="Transit Compliance Copilot",
-        page_icon="🚍",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -318,10 +418,8 @@ def apply_theme() -> None:
                 --muted: #2f4843;
                 --line: rgba(13, 29, 26, 0.16);
                 --accent: #0f766e;
-                --accent-2: #ca8a04;
                 --shadow: 0 24px 60px rgba(13, 29, 26, 0.10);
                 --focus: #0b5f59;
-                --radius: 24px;
             }
 
             .stApp {
@@ -545,7 +643,7 @@ def apply_theme() -> None:
                 color: var(--ink);
             }
 
-            .stButton > button, .stDownloadButton > button {
+            .stButton > button {
                 border-radius: 999px;
                 border: 1px solid rgba(13, 29, 26, 0.14);
                 background: var(--surface-strong);
@@ -554,14 +652,13 @@ def apply_theme() -> None:
                 transition: transform 120ms ease, box-shadow 120ms ease;
             }
 
-            .stButton > button:hover, .stDownloadButton > button:hover {
+            .stButton > button:hover {
                 transform: translateY(-1px);
                 box-shadow: 0 10px 25px rgba(16, 35, 29, 0.08);
                 border-color: rgba(15,118,110,0.28);
             }
 
             .stButton > button:focus,
-            .stDownloadButton > button:focus,
             .stChatInput textarea:focus {
                 outline: 2px solid var(--focus) !important;
                 outline-offset: 1px !important;
@@ -635,12 +732,9 @@ def queue_prompt(prompt: str) -> None:
     st.session_state["queued_prompt"] = prompt
 
 
-def render_hero(manifest: dict[str, Any]) -> None:
-    stats = manifest.get("stats", {})
-    documents = manifest.get("documents", [])
-    created_at = format_timestamp(manifest.get("created_at_utc"))
-    device = detect_device()
-    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU mode"
+def render_hero(summary: dict[str, Any], device_label: str) -> None:
+    stats = summary.get("stats", {})
+    documents = summary.get("documents", [])
     doc_names = "".join(
         f"<span class='source-chip'>{escape(doc.get('title', 'Unknown document'))}</span>"
         for doc in documents
@@ -652,9 +746,9 @@ def render_hero(manifest: dict[str, Any]) -> None:
             <div class="eyebrow">Transit regulation intelligence</div>
             <h1 class="hero-title">Cited answers across Part 37 and Part 38.</h1>
             <p class="hero-copy">
-                Ask operational, compliance, ADA, vehicle, or paratransit questions against your locally indexed federal
-                regulations. Retrieval, reranking, and generation all run from artifacts built by the notebook so the app
-                does not rebuild indexes at question time.
+                Ask operational, compliance, ADA, vehicle, or paratransit questions against the bundled CFR PDFs.
+                The deployed app builds its retrieval index in memory at startup, then returns grounded answers with
+                page citations and transparent evidence panels.
             </p>
             <div class="metric-grid">
                 <div class="metric-card">
@@ -666,12 +760,12 @@ def render_hero(manifest: dict[str, Any]) -> None:
                     <div class="metric-value">{stats.get('chunk_count', 'Unknown')}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">Compute</div>
-                    <div class="metric-value">{escape(gpu_name)}</div>
+                    <div class="metric-label">Runtime</div>
+                    <div class="metric-value">{escape(device_label)}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">Artifacts built</div>
-                    <div class="metric-value">{escape(created_at)}</div>
+                    <div class="metric-label">Index mode</div>
+                    <div class="metric-value">In memory</div>
                 </div>
             </div>
             <div style="margin-top: 0.8rem;">{doc_names}</div>
@@ -681,12 +775,8 @@ def render_hero(manifest: dict[str, Any]) -> None:
     )
 
 
-def render_sidebar(manifest: dict[str, Any]) -> None:
-    device, device_warning = resolve_runtime_device()
-    generator_name = Path(manifest["models"]["generator_dir"]).name
-    embedding_name = Path(manifest["models"]["embedding_dir"]).name
-    reranker_name = Path(manifest["models"]["reranker_dir"]).name
-    retrieval = manifest.get("retrieval", {})
+def render_sidebar(bot: TransitComplianceBot) -> None:
+    runtime = bot.summary.get("runtime", {})
 
     with st.sidebar:
         st.markdown("## Control Room")
@@ -698,27 +788,27 @@ def render_sidebar(manifest: dict[str, Any]) -> None:
             f"""
             <div class="sidebar-card">
                 <div class="sidebar-kicker">System status</div>
-                <div class="sidebar-title">Ready for local retrieval</div>
+                <div class="sidebar-title">Ready for cloud deployment</div>
                 <div style="color:var(--muted); margin-top:0.35rem;">
-                    Device: <strong>{escape(device.upper())}</strong><br>
-                    Dense + BM25 hybrid retrieval with cross-encoder reranking.
+                    Device: <strong>{escape(bot.device.upper())}</strong><br>
+                    PDF-backed hybrid retrieval with a lightweight QA model.
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        if device_warning:
-            st.warning(device_warning)
+        if bot.device_warning:
+            st.info(bot.device_warning)
 
         st.markdown(
             f"""
             <div class="sidebar-card">
                 <div class="sidebar-kicker">Model stack</div>
-                <div class="sidebar-title">{escape(generator_name)}</div>
+                <div class="sidebar-title">{escape(CONFIG.qa_model_id)}</div>
                 <div style="color:var(--muted); margin-top:0.35rem;">
-                    Embeddings: {escape(embedding_name)}<br>
-                    Reranker: {escape(reranker_name)}
+                    Embeddings: {escape(CONFIG.embedding_model_id)}<br>
+                    Answering mode: extractive with citations
                 </div>
             </div>
             """,
@@ -729,11 +819,11 @@ def render_sidebar(manifest: dict[str, Any]) -> None:
             f"""
             <div class="sidebar-card">
                 <div class="sidebar-kicker">Retrieval profile</div>
-                <div class="sidebar-title">High-recall, citation-first</div>
+                <div class="sidebar-title">Portable streamlit runtime</div>
                 <div style="color:var(--muted); margin-top:0.35rem;">
-                    Dense top-k: {retrieval.get('dense_top_k', 'n/a')}<br>
-                    BM25 top-k: {retrieval.get('bm25_top_k', 'n/a')}<br>
-                    Reranked context: {retrieval.get('rerank_top_n', 'n/a')}
+                    Dense top-k: {runtime.get('dense_top_k', 'n/a')}<br>
+                    BM25 top-k: {runtime.get('bm25_top_k', 'n/a')}<br>
+                    Final evidence set: {runtime.get('final_top_k', 'n/a')}
                 </div>
             </div>
             """,
@@ -747,7 +837,7 @@ def render_sidebar(manifest: dict[str, Any]) -> None:
                 st.rerun()
 
         st.markdown("### Documents")
-        for document in manifest.get("documents", []):
+        for document in bot.summary.get("documents", []):
             st.markdown(
                 f"""
                 <div class="sidebar-card">
@@ -775,8 +865,8 @@ def render_source_cards(contexts: list[dict[str, Any]]) -> None:
         st.markdown(
             f"""
             <div class="source-card">
-                <h4>#{context.get("rank", "?")} · {citation}</h4>
-                <div class="source-meta">{section_hint} · {source_file}</div>
+                <h4>#{context.get("rank", "?")} | {citation}</h4>
+                <div class="source-meta">{section_hint} | {source_file}</div>
                 <div class="source-excerpt">{excerpt}</div>
             </div>
             """,
@@ -814,19 +904,13 @@ def render_message(message: dict[str, Any]) -> None:
 
 
 def render_setup_blocker(error_text: str) -> None:
-    st.error("The retrieval artifacts are missing, so the app cannot answer questions yet.")
+    st.error("The app could not initialize its PDF-backed retrieval engine.")
     st.markdown(
         f"""
         <div class="panel-card">
             <strong>Setup required</strong><br><br>
             {escape(error_text)}<br><br>
-            Run the notebook first so these files exist:
-            <ul>
-                <li><code>artifacts/manifest.json</code></li>
-                <li><code>artifacts/chunks.jsonl</code></li>
-                <li><code>artifacts/chroma_db/</code></li>
-            </ul>
-            Then launch the app with <code>streamlit run app.py</code>.
+            This deployed app expects the two source PDFs to be present in the repository root.
         </div>
         """,
         unsafe_allow_html=True,
@@ -852,12 +936,12 @@ def collect_prompt() -> str | None:
 
 def answer_question(question: str) -> dict[str, Any]:
     with st.status("Processing question", expanded=True) as status:
-        status.write("Loading the local retrieval and generation stack.")
+        status.write("Loading the portable transit compliance engine.")
         bot = get_bot()
         status.write("Searching the indexed regulations with dense and lexical retrieval.")
         documents = bot.retrieve(question)
-        status.write(f"Selected {len(documents)} evidence chunks for the final answer.")
-        status.write("Generating a citation-grounded answer from the local language model.")
+        status.write(f"Selected {len(documents)} evidence chunks for answer construction.")
+        status.write("Extracting the strongest grounded answer spans from the retrieved text.")
         answer = bot.generate_answer(question, documents)
         response = {
             "role": "assistant",
@@ -874,17 +958,17 @@ def main() -> None:
     init_session_state()
 
     try:
-        manifest = load_manifest()
-    except FileNotFoundError as error:
+        bot = get_bot()
+    except Exception as error:
         render_setup_blocker(str(error))
         return
 
-    render_sidebar(manifest)
+    render_sidebar(bot)
 
     left, right = st.columns([3.2, 1.15], gap="large")
 
     with left:
-        render_hero(manifest)
+        render_hero(bot.summary, bot.device.upper())
         render_quick_actions()
 
         if not st.session_state["messages"]:
@@ -892,8 +976,8 @@ def main() -> None:
                 """
                 <div class="panel-card" style="margin-top: 1rem;">
                     <strong>What this app does</strong><br><br>
-                    It answers only from the two indexed CFR documents, shows the retrieved evidence behind each answer,
-                    and keeps the expensive retrieval artifacts on disk so the app does not re-embed or rebuild indexes.
+                    It indexes the two bundled CFR PDFs at startup, retrieves the most relevant regulatory excerpts in
+                    memory, and answers with explicit page citations plus a visible evidence trail.
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -918,7 +1002,7 @@ def main() -> None:
             """
             <div class="panel-card">
                 <strong>Answer design</strong><br><br>
-                Responses are expected to stay concise, grounded in the indexed text, and explicitly cited by page.
+                Responses are grounded in retrieved CFR text, then rendered with page citations and supporting excerpts.
             </div>
             """,
             unsafe_allow_html=True,
@@ -927,20 +1011,18 @@ def main() -> None:
         st.markdown(
             """
             <div class="panel-card" style="margin-top: 1rem;">
-                <strong>Recommended usage</strong><br><br>
-                Ask one operational question at a time. If you need a comparison, name both topics explicitly so retrieval
-                can pull the right sections from both Part 37 and Part 38.
+                <strong>Deployment profile</strong><br><br>
+                This version is optimized for Streamlit Community Cloud: no Chroma dependency at runtime, no prebuilt
+                artifact requirement, and lightweight Hugging Face models that can initialize directly from the repo PDFs.
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+        st.metric("Chunks in memory", bot.summary["stats"]["chunk_count"])
+
         if st.session_state["messages"]:
-            assistant_count = sum(
-                1 for message in st.session_state["messages"] if message["role"] == "assistant"
-            )
-            st.metric("Answers in session", assistant_count)
-            latest_sources = []
+            latest_sources: list[str] = []
             for message in reversed(st.session_state["messages"]):
                 if message["role"] == "assistant" and message.get("sources"):
                     latest_sources = message["sources"]

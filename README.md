@@ -9,19 +9,20 @@ The system is designed to answer operational and compliance questions about ADA 
 
 ## What This Project Does
 
-This project builds a local retrieval-augmented generation (RAG) pipeline over the two CFR PDFs and serves it through a Streamlit chat app.
+This project builds a transit-regulation question answering system over the two CFR PDFs and serves it through a Streamlit chat app.
 
 At a high level:
 
-1. `code.ipynb` prepares the knowledge base.
-2. The notebook extracts text from the PDFs, chunks it, embeds it, and saves the retrieval artifacts.
-3. `app.py` loads those saved artifacts and runs a user-friendly Streamlit interface.
-4. User questions are answered with retrieved excerpts and page-level citations.
+1. `code.ipynb` prepares an optional local artifact-based knowledge base.
+2. The notebook extracts text from the PDFs, chunks it, embeds it, and saves retrieval artifacts for local use.
+3. `app.py` provides a Streamlit interface that is deployable on Streamlit Community Cloud.
+4. In deployed mode, the app reads the PDFs directly, builds an in-memory index at startup, and answers with page-level citations.
 
 Important technical point:
 
 - This project does **not** fine-tune or "train" a language model on the documents in the classic ML sense.
-- Instead, it precomputes retrieval artifacts so the app can answer faster and more reliably at runtime.
+- Instead, it uses retrieval and lightweight Hugging Face models to answer from the source text.
+- The notebook precomputes artifacts for a heavier local workflow, while the deployed Streamlit app uses a portable in-memory workflow.
 
 ## Current Indexed Corpus
 
@@ -39,7 +40,36 @@ Source files currently configured:
 
 ## Technical Architecture
 
-The system uses a local RAG architecture with three model roles:
+The repository now supports two runtime profiles:
+
+- `Cloud / Streamlit Community Cloud mode`
+- `Local artifact-backed mode`
+
+### Cloud / Streamlit Community Cloud Mode
+
+This is the runtime implemented by `app.py` today.
+
+It is designed to avoid:
+
+- `artifacts/` dependencies
+- `chromadb` runtime imports
+- large locally committed model snapshots
+
+Instead, the deployed app:
+
+1. loads the two bundled PDFs directly from the repo
+2. extracts and chunks them in memory at startup
+3. builds dense embeddings with `sentence-transformers/all-MiniLM-L6-v2`
+4. runs lexical retrieval with BM25
+5. fuses dense and lexical retrieval results
+6. extracts answer spans with `distilbert-base-cased-distilled-squad`
+7. returns grounded answers with page citations and visible supporting excerpts
+
+### Local Artifact-Backed Mode
+
+The notebook still supports a heavier local workflow using a persisted vector index and local downloaded models.
+
+That local workflow uses:
 
 - Embedding model: `BAAI/bge-base-en-v1.5`
 - Reranker model: `BAAI/bge-reranker-base`
@@ -52,9 +82,9 @@ All selected models are:
 - ungated
 - runnable locally
 
-### Retrieval Pipeline
+### Local Retrieval Pipeline
 
-The notebook and app implement the following flow:
+The notebook implements the following local build flow:
 
 1. PDF extraction with `PyMuPDF`
 2. Text normalization and cleanup
@@ -86,7 +116,7 @@ It does the following:
 - saves the chunk metadata file
 - writes a manifest describing the model paths, retrieval settings, and corpus stats
 
-This reduces lag in the Streamlit app because the app loads prebuilt artifacts instead of rebuilding the index during startup or on each query.
+This notebook is now mainly for the local artifact-backed workflow. It is still useful if you want a stronger local stack with persisted retrieval artifacts, but it is not required for Streamlit Community Cloud deployment.
 
 ## Artifact Layout
 
@@ -103,7 +133,7 @@ artifacts/
     generator/
 ```
 
-These files are required by `app.py`.
+These files are used by the local artifact-backed workflow. The deployed Streamlit Cloud app does not require them.
 
 ## Main Files
 
@@ -111,34 +141,31 @@ These files are required by `app.py`.
   Offline build notebook for model download, PDF processing, chunking, embedding, and artifact generation.
 
 - `app.py`
-  Streamlit application for interactive question answering, retrieval display, source transparency, and chat UX.
+  Streamlit application for interactive question answering, retrieval display, source transparency, and a cloud-compatible in-memory retrieval workflow.
 
 - `requirements.txt`
   Python dependencies for LangChain, Chroma, Transformers, Streamlit, PyMuPDF, and related runtime libraries.
 
 ## Streamlit App Behavior
 
-The app is designed as a local analyst interface rather than a generic chatbot. It provides:
+The app is designed as a transit analyst interface rather than a generic chatbot. It provides:
 
 - a chat-based UI for regulatory questions
-- preloaded local models and saved retrieval artifacts
+- startup indexing directly from the bundled PDFs
 - evidence-backed answers
 - visible retrieved source excerpts
 - citation display for each response
 - example prompts and session history
-- setup checks if artifacts are missing
+- setup checks if the source PDFs are missing
 
 The app is intentionally scoped to the indexed documents. If the answer is not supported by the retrieved excerpts, the assistant should avoid inventing information.
 
 ## Dependencies
 
-Main libraries used in this project:
+Main runtime libraries used in the deployed app:
 
-- `langchain`
 - `langchain-community`
 - `langchain-huggingface`
-- `langchain-chroma`
-- `chromadb`
 - `transformers`
 - `sentence-transformers`
 - `PyMuPDF`
@@ -149,17 +176,23 @@ See `requirements.txt` for pinned version ranges.
 
 ## Setup
 
-Install dependencies:
+Install Streamlit app dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-If you want GPU acceleration, install a CUDA-enabled PyTorch build that matches your GPU and CUDA stack. This project can use CUDA when available, but it also includes fallback logic to use CPU if the installed PyTorch runtime cannot execute on the detected GPU architecture.
+For the local notebook workflow, install the larger dependency set:
 
-## Build the Retrieval Artifacts
+```bash
+pip install -r requirements-local.txt
+```
 
-Run the notebook:
+If you want GPU acceleration locally, install a CUDA-enabled PyTorch build that matches your GPU and CUDA stack.
+
+## Optional Local Artifact Build
+
+Run the notebook only if you want the local artifact-backed workflow:
 
 ```bash
 jupyter notebook code.ipynb
@@ -174,13 +207,27 @@ Execute the cells to:
 
 ## Run the App
 
-After the artifacts are built:
+For the deployed or portable app:
 
 ```bash
 streamlit run app.py
 ```
 
 ## Retrieval Configuration
+
+### Cloud runtime
+
+The current deployed app uses:
+
+- Embedding model: `sentence-transformers/all-MiniLM-L6-v2`
+- QA model: `distilbert-base-cased-distilled-squad`
+- Chunk size: `950`
+- Chunk overlap: `180`
+- Dense top-k: `8`
+- BM25 top-k: `8`
+- Final evidence set: `5`
+
+### Local artifact-backed runtime
 
 The current build configuration stored in the manifest is:
 
@@ -203,6 +250,7 @@ These values favor grounded, concise answers over open-ended generation.
 - PDF extraction quality can affect retrieval quality.
 - Citation accuracy depends on the extracted page metadata and the relevance of the retrieved chunks.
 - GPU acceleration depends on having a compatible PyTorch build for the actual GPU architecture in the active environment.
+- Streamlit Community Cloud has limited CPU and RAM, so the deployed app uses a lighter extractive QA pipeline instead of the heavier local generator stack.
 
 ## Recommended Use Cases
 
@@ -223,4 +271,4 @@ Possible technical extensions:
 
 ## Summary
 
-This repository is a local, technical RAG system for transit regulation Q&A. The notebook builds the retrieval layer once, and the Streamlit app serves fast, cited answers from the saved artifacts. The main design goal is not generic chat, but reliable document-grounded assistance for transit professionals working with Part 37 and Part 38.
+This repository is a technical transit-regulation QA system with two operating modes: a deployable Streamlit Cloud runtime that builds an in-memory index directly from the PDFs, and an optional heavier local artifact-backed workflow built through the notebook. In both cases, the design goal is reliable document-grounded assistance for transit professionals working with Part 37 and Part 38.
